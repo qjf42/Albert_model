@@ -1,139 +1,75 @@
 # coding: utf-8
 
-import sys
 import gc
-import time
-import json
 from typing import Any, Dict
 
 import flask
-import pandas as pd
-import torch
-# from torch.autograd import profiler
 
-from .dynamic_loader import DynamicLoader
+from .conf import LOG_CONF
+from .enums import EnumResponseError
+from .interfaces import Response
 from .utils import log_utils
-
-
-class PytorchModel:
-    def __init__(self, name: str, model_conf_file: str):
-        self.serving = False
-        self.meta = {}
-        self.name = name
-        self.load(model_conf_file)
-
-    @property
-    def running(self):
-        return self.model is not None and self.serving
-
-    def load(self, model_conf_file: str) -> None:
-        '''加载模型处理的pipeline和测试case'''
-        with open(model_conf_file) as f:
-            conf = json.load(f)
-
-        # （如有）预处理模块
-        self.preprocessor = None
-        if 'preprocess' in conf:
-            try:
-                self.preprocessor = DynamicLoader.load(conf['preprocess'])
-                assert callable(self.preprocessor), 'preprocessor not callable'
-            except Exception as e:
-                raise Exception(f'Failed to load preprocessor, {e}')
-
-        # 模型
-        try:
-            self.model = torch.load(conf['model'], map_location=torch.device('cpu'))
-            assert isinstance(self.model, torch.nn.Module), 'model is not a torch.nn.Module'
-        except Exception as e:
-            raise Exception(f'Failed to load model, {e}')
-
-        # （如有）后处理模块
-        self.postprocessor = None
-        if 'postprocess' in conf:
-            try:
-                self.postprocessor = DynamicLoader.load(conf['postprocess'])
-                assert callable(self.postprocessor), 'postprocessor not callable'
-            except Exception as e:
-                raise Exception(f'Failed to load postprocessor, {e}')
-
-        self.test_case = (conf['test_case']['input'], conf['test_case']['expected'])
-
-    def infer(self, params: Dict[str, Any]):
-        if not self.running:
-            raise Exception(f'Model {self.name} not initialized or running')
-        if self.preprocess_module:
-            params = self.preprocess_module(params)
-        model_res = self.model(params)
-        if self.postprocess_module:
-            model_res = self.postprocess_module(params, model_res)
-        return model_res
-
-    def memory_usage(self):
-        # param size
-        size = sum(p.numel() * p.element_size() for p in self.model.parameters())
-        # TODO
-        # forward
-        # output
-        return f'{(size / 2**20):.2f}MB'
-
-    def profile(self) -> pd.DataFrame:
-        # https://pytorch.org/tutorials/recipes/recipes/profiler.html
-        pass
-
-    def test(self) -> bool:
-        params, expected = self.test_case
-        try:
-            res = self.infer(params)
-        except Exception as e:
-            raise Exception(f'Model {self.name} test inference error: {e}')
-        assert expected == res, f'Model {self.name} test error, expected({expected}) vs result({res})'
-        return True
-
-    def compare(self, model):
-        pass
+from ..processor import ProcessorBase, ProcessorFactory
 
 
 class ModelService:
-    def __init__(self): 
-        self.models: Dict[str, PytorchModel] = {}
+    def __init__(self):
+        self.processor_factory = ProcessorFactory()
+        # 模型名 => 位置 => processor之间一一映射
+        self._name2dirs: Dict[str, str] = {}
 
-    def register(self, name: str, model_conf_file: str):
+    def _check_model(self, name: str) -> ProcessorBase:
+        try:
+            return self.processor_factory[self._name2dirs[name]]
+        except:
+            raise ValueError(f'Model [{name}] does not exisit')
+
+    def register(self, name: str, model_dir: str, force_reload: bool = False):
         '''模型注册上线、更新'''
-        new_model = PytorchModel(name, model_conf_file)
-        self.models[name] = new_model
+        self.processor_factory.load(name, model_dir, force_reload)
+        self._name2dirs[name] = model_dir
         gc.collect()
 
     def unregister(self, name: str):
         '''模型下线'''
-        if name in self.models:
-            del self.models[name]
-            gc.collect()
+        self._check_model(name)
+        dir_name = self._name2dirs[name]
+        del self._name2dirs[name]
+        del self.processor_factory[dir_name]
+        gc.collect()
 
     def infer(self, name: str, params: Dict[str, Any]):
-        if name in self.models:
-            return self.models[name].infer(params)
+        model = self._check_model(name)
+        return model.run(params)
 
+    """
     def memory_usage(self):
         for name in self.models:
             pass
 
     def profile(self, name: str):
+        self._check_model(name)
         print(self.models[name].profile())
+    """
 
 
 '''FLASK'''
 
-BOT = ModelService()
+SERVICE = ModelService()
 app = flask.Flask(__name__)
 log_utils.set_app_logger(app.logger, **LOG_CONF)
 
 
-def parse_req(options):
-    ret = {}
+def parse_req(options=None):
     req = flask.request
-    data = req.get_json(silent=True) or {}
+    params = dict(req.args)
+    params.update(req.get_json(silent=True) or {})
+    params.update(req.form or {})
+    if not options:
+        return params
+    ret = {}
     for key, required in options.items():
-        val = req.args.get(key, data.get(key, req.form.get(key)))
+        val = params.get(key)
         if val is None and required:
             raise ValueError(f'Parameter [{key}] is missing.')
         ret[key] = val
@@ -143,17 +79,57 @@ def parse_req(options):
 @app.route('/register', methods=['POST'])
 def register():
     param_options = {
-        'query': True,
+        'model_name': True,
+        'model_dir': True,
+        'force_reload': False,
     }
     try:
-        query = parse_req(param_options)['query'].strip()
+        params = parse_req(param_options)
+        model_name = params['model_name']
+        model_dir = params['model_dir']
+        force_reload = params.get('force_reload', False)
+    except Exception as e:
+        resp = Response().set_error(EnumResponseError.INVALID_PARAMS, str(e))
+        return flask.jsonify(resp)
+    app.logger.info(f'Registering model [{model_name}] in [{model_dir}]...')
+    try:
+        SERVICE.register(model_name, model_dir, force_reload)
+        app.logger.info(f'Registering model [{model_name}] succeeded.')
+    except Exception as e:
+        resp = Response().set_error(EnumResponseError.UNKNOWN_ERROR, str(e))
+        app.logger.info(f'Registering model [{model_name}] failed, {e}.')
+    return flask.jsonify(Response())
+
+
+@app.route('/unregister', methods=['POST'])
+def unregister():
+    param_options = {
+        'model_name': True,
+    }
+    try:
+        model_name = parse_req(param_options)['model_name']
     except:
-        resp = BotResponse().set_error(EnumResponseError.INVALID_PARAMS)
+        resp = Response().set_error(EnumResponseError.INVALID_PARAMS)
         return flask.jsonify(resp)
     try:
-        req = RequestFactory.get_request(EnumRequestSrcType.CMD, query, debug=True)
-        resp = BOT.chat(req)
+        resp = SERVICE.unregister(model_name)
     except Exception as e:
-        resp = BotResponse().set_error(EnumResponseError.UNKNOWN_ERROR, str(e))
+        resp = Response().set_error(EnumResponseError.UNKNOWN_ERROR, str(e))
     return flask.jsonify(resp)
 
+
+@app.route('/infer', methods=['GET'])
+def infer():
+    params = parse_req()
+    try:
+        model_name = params.pop('model_name')
+    except:
+        resp = Response().set_error(EnumResponseError.INVALID_PARAMS, 'missing param "model_name"')
+        return flask.jsonify(resp)
+    try:
+        resp = Response()
+        for k, v in SERVICE.infer(model_name, params).items():
+            resp.add_data(k, v)
+    except Exception as e:
+        resp = Response().set_error(EnumResponseError.INFER_ERROR, str(e))
+    return flask.jsonify(resp)

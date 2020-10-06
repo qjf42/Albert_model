@@ -6,4 +6,5 @@ from enum import Enum, auto
 
 class EnumEnv(Enum):
     DEV = auto()
+    TEST = auto()
     PROD = auto()

@@ -7,6 +7,7 @@ from enum import Enum
 class EnumResponseError(Enum):
     SUCCESS = (True, 0, '')
     INVALID_PARAMS = (False, 100, '')
+    INFER_ERROR = (False, 400, '')
     UNKNOWN_ERROR = (False, 500, '')
 
     def __init__(self, success: bool, err_no: int, err_msg: str):
